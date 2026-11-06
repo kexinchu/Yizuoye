@@ -8,6 +8,18 @@ function displayTime(iso) {
   return `${date.toLocaleDateString('zh-CN')} ${time}`;
 }
 
+async function visibleNotices(user) {
+  const rows = await many(`SELECT n.body, n.class_id, c.name AS class_name
+    FROM notices n LEFT JOIN classes c ON c.id = n.class_id
+    ORDER BY n.id DESC LIMIT 100`);
+  const mine = user.role === 'teacher'
+    ? null
+    : new Set((await many('SELECT class_id FROM roster WHERE student_id=$1', [user.id])).map((row) => row.class_id));
+  return rows
+    .filter((row) => !mine || row.class_id == null || mine.has(row.class_id))
+    .map((row) => (row.class_name ? `【${row.class_name}】${row.body}` : row.body));
+}
+
 export async function buildState(user) {
   const fresh = await getUser(user.id) || user;
   const classes = [];
@@ -20,7 +32,7 @@ export async function buildState(user) {
       id: course.id,
       name: course.name,
       course: course.course,
-      students: Math.max(course.declared_count || 0, roster.length),
+      students: roster.length ? roster.length : (course.declared_count || 0),
       startDate: course.start_date || '',
       endDate: course.end_date || '',
       roster,
@@ -99,7 +111,7 @@ export async function buildState(user) {
     products: await many('SELECT id, name, cost, stock, emoji FROM products ORDER BY id'),
     messages: (await many('SELECT name, body, created_at FROM messages ORDER BY id DESC LIMIT 200'))
       .map((row) => ({ name: row.name, body: row.body, time: displayTime(row.created_at) })),
-    notices: (await many('SELECT body FROM notices ORDER BY id DESC LIMIT 100')).map((row) => row.body),
+    notices: await visibleNotices(fresh),
     resources: (await many(`SELECT r.id, r.name, f.id AS file_id
       FROM resources r LEFT JOIN files f ON f.kind = 'resource' AND f.ref_id = r.id::text
       ORDER BY r.id`)).map((row) => ({

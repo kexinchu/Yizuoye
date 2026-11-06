@@ -14,6 +14,7 @@ import {
   checkin,
   createAttendance,
   createClass,
+  deleteClass,
   createCourseware,
   createProduct,
   createResource,
@@ -21,13 +22,18 @@ import {
   createTask,
   deleteTask,
   deleteTaskFile,
+  updateTask,
   destroySession,
   discardUploads,
   getDownload,
   importRoster,
+  removeRosterStudent,
+  resetStudentPassword,
+  updateClass,
   login,
   one,
   publicUser,
+  postNotice,
   ready,
   redeemProduct,
   register,
@@ -168,6 +174,26 @@ export function createApp() {
     res.json({ ok: true, ...result });
   }));
 
+  app.patch('/api/classes/:id', requireUser, requireTeacher, route(async (req, res) => {
+    await updateClass({ id: req.params.id, name: req.body?.name, startDate: req.body?.startDate, endDate: req.body?.endDate });
+    res.json({ ok: true });
+  }));
+
+  app.delete('/api/classes/:id', requireUser, requireTeacher, route(async (req, res) => {
+    await deleteClass(req.params.id);
+    res.json({ ok: true });
+  }));
+
+  app.delete('/api/classes/:id/roster/:account', requireUser, requireTeacher, route(async (req, res) => {
+    await removeRosterStudent(req.params.id, req.params.account);
+    res.json({ ok: true });
+  }));
+
+  app.post('/api/classes/:id/roster/:account/password', requireUser, requireTeacher, route(async (req, res) => {
+    await resetStudentPassword(req.params.id, req.params.account, req.body?.password);
+    res.json({ ok: true });
+  }));
+
   app.post('/api/roster/parse', requireUser, requireTeacher, upload.single('file'), route(async (req, res) => {
     if (!req.file) throw new HttpError(400, '请选择名单文件');
     let text = '';
@@ -207,7 +233,7 @@ export function createApp() {
     res.json(recognizeAssignment(req.body?.raw || ''));
   }));
 
-  app.post('/api/classes/:id/tasks', requireUser, requireTeacher, upload.array('files', 20), route(async (req, res) => {
+  app.post('/api/classes/:id/tasks', requireUser, requireTeacher, upload.any(), route(async (req, res) => {
     const files = uploadsOf(req);
     for (const file of files) file.originalname = originalName(file);
     await createTask({
@@ -221,6 +247,23 @@ export function createApp() {
       notes: req.body?.notes,
       uploads: files,
       names: files.map((file) => file.originalname),
+    });
+    res.json({ ok: true });
+  }));
+
+  app.put('/api/tasks/:id', requireUser, requireTeacher, upload.any(), route(async (req, res) => {
+    const files = uploadsOf(req);
+    for (const file of files) file.originalname = originalName(file);
+    await updateTask({
+      taskId: req.params.id,
+      title: req.body?.title,
+      week: req.body?.week,
+      sections: req.body?.sections,
+      points: req.body?.points,
+      deadline: req.body?.deadline,
+      types: req.body?.types,
+      notes: req.body?.notes,
+      uploads: files,
     });
     res.json({ ok: true });
   }));
@@ -266,6 +309,11 @@ export function createApp() {
 
   app.post('/api/messages', requireUser, route(async (req, res) => {
     await addMessage(req.user, req.body?.body);
+    res.json({ ok: true });
+  }));
+
+  app.post('/api/notices', requireUser, requireTeacher, route(async (req, res) => {
+    await postNotice({ classId: req.body?.classId, body: req.body?.body });
     res.json({ ok: true });
   }));
 

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { crc32 } from 'node:zlib';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -220,8 +221,20 @@ export function todayKey(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-async function addNotice(body) {
-  await q('INSERT INTO notices(body, created_at) VALUES ($1, NOW())', [body]);
+async function addNotice(body, classId = null) {
+  await q('INSERT INTO notices(body, class_id, created_at) VALUES ($1, $2, NOW())', [body, classId]);
+}
+
+export async function postNotice({ classId, body }) {
+  const text = String(body || '').trim();
+  if (!text) throw new HttpError(400, '请填写通知内容');
+  let courseId = null;
+  if (classId) {
+    const course = await one('SELECT id FROM classes WHERE id=$1', [Number(classId)]);
+    if (!course) throw new HttpError(404, '班级不存在');
+    courseId = course.id;
+  }
+  await addNotice(text.slice(0, 2000), courseId);
 }
 
 function filePath(id) {
@@ -258,6 +271,96 @@ async function insertFile({ kind, refId, userId, upload, name }) {
   return { id, name, size: upload.size || 0 };
 }
 
+function zipStore(files) {
+  const parts = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, data] of files) {
+    const nameBuf = Buffer.from(name);
+    const content = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const crc = crc32(content) >>> 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(content.length, 18);
+    local.writeUInt32LE(content.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(content.length, 20);
+    centralHeader.writeUInt32LE(content.length, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt32LE(offset, 42);
+    parts.push(local, nameBuf, content);
+    central.push(centralHeader, nameBuf);
+    offset += local.length + nameBuf.length + content.length;
+  }
+  const centralBuf = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralBuf.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, centralBuf, end]);
+}
+
+function miniPdf(text) {
+  const content = `BT /F1 18 Tf 40 120 Td (${String(text).replace(/[()\\]/g, '')}) Tj ET`;
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n',
+    `4 0 obj\n<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`,
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (const object of objects) {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += object;
+  }
+  const xref = Buffer.byteLength(pdf);
+  pdf += 'xref\n0 6\n0000000000 65535 f \n';
+  for (let index = 1; index <= 5; index += 1) pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf);
+}
+
+function miniDocx(paragraphs) {
+  const document = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+${paragraphs.map((line) => `<w:p><w:r><w:t xml:space="preserve">${line}</w:t></w:r></w:p>`).join('')}
+</w:body></w:document>`;
+  const types = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`;
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`;
+  return zipStore([
+    ['[Content_Types].xml', types],
+    ['_rels/.rels', rels],
+    ['word/document.xml', document],
+  ]);
+}
+
+async function storeNamedFile({ kind, refId, name, bytes, mime }) {
+  const id = randomUUID();
+  fs.writeFileSync(path.join(uploadDir, id), bytes);
+  await q(`INSERT INTO files(id, kind, ref_id, user_id, name, mime, size, created_at)
+    VALUES ($1, $2, $3, NULL, $4, $5, $6, NOW())`, [id, kind, String(refId), name, mime, bytes.length]);
+  return id;
+}
+
 async function seedContent() {
   const teacherHash = hashPassword('123');
   const studentHash = hashPassword('123');
@@ -274,7 +377,7 @@ async function seedContent() {
     { title: '任务二：口语表达', content: '录制一段1分钟的中文音频。', type: 'writing', options: [], correct: '', audio: '' },
   ];
   await q(`INSERT INTO tasks(class_id, title, week, sections_json, points, deadline, types, notes, created_at)
-    VALUES (1, '第一周 · 我的大学生活', 0, $1, 5, '2026-12-15T23:59', '音频、文档', '注意语音和语法。', NOW())`, [JSON.stringify(sections)]);
+    VALUES (1, '第一周 · 我的大学生活', 0, $1, 1, '2026-12-15T23:59', '音频、文档', '注意语音和语法。', NOW())`, [JSON.stringify(sections)]);
   const products = [
     ['精美中文笔记本', 20, 12, '📓'],
     ['中国文化书签', 8, 30, '🔖'],
@@ -288,8 +391,22 @@ async function seedContent() {
   await q('INSERT INTO messages(name, body, created_at) VALUES ($1, $2, $3)', ['张三', '老师，口语作业可以上传音频吗？', morning.toISOString()]);
   await q('INSERT INTO notices(body, created_at) VALUES ($1, NOW())', ['第一周作业已发布，请按时完成。']);
   await q('INSERT INTO notices(body, created_at) VALUES ($1, NOW())', ['欢迎使用易作业！']);
-  await q('INSERT INTO resources(name, created_at) VALUES ($1, NOW())', ['HSK三级词汇表.pdf']);
-  await q('INSERT INTO resources(name, created_at) VALUES ($1, NOW())', ['汉语口语练习材料.docx']);
+  const vocabulary = await one('INSERT INTO resources(name, created_at) VALUES ($1, NOW()) RETURNING id', ['HSK三级词汇表.pdf']);
+  await storeNamedFile({
+    kind: 'resource',
+    refId: vocabulary.id,
+    name: 'HSK三级词汇表.pdf',
+    bytes: miniPdf('HSK vocabulary'),
+    mime: 'application/pdf',
+  });
+  const speaking = await one('INSERT INTO resources(name, created_at) VALUES ($1, NOW()) RETURNING id', ['汉语口语练习材料.docx']);
+  await storeNamedFile({
+    kind: 'resource',
+    refId: speaking.id,
+    name: '汉语口语练习材料.docx',
+    bytes: miniDocx(['请用中文介绍你的大学和专业。']),
+    mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  });
 }
 
 let starting;
@@ -303,8 +420,33 @@ export function ready() {
   return starting;
 }
 
+function columnExists(table, name) {
+  return sqlite.prepare(`PRAGMA table_info(${table})`).all().some((column) => column.name === name);
+}
+
+async function repairExistingData() {
+  await q(`UPDATE tasks SET points=1 WHERE title=$1 AND points=5`, ['第一周 · 我的大学生活']);
+  const missing = await many(`SELECT r.id, r.name FROM resources r
+    LEFT JOIN files f ON f.kind='resource' AND f.ref_id = CAST(r.id AS TEXT)
+    WHERE f.id IS NULL`);
+  for (const row of missing) {
+    if (row.name === 'HSK三级词汇表.pdf') {
+      await storeNamedFile({ kind: 'resource', refId: row.id, name: row.name, bytes: miniPdf('HSK vocabulary'), mime: 'application/pdf' });
+    } else if (row.name === '汉语口语练习材料.docx') {
+      await storeNamedFile({
+        kind: 'resource',
+        refId: row.id,
+        name: row.name,
+        bytes: miniDocx(['请用中文介绍你的大学和专业。']),
+        mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      });
+    }
+  }
+}
+
 async function migrateAndSeed() {
   sqlite.exec(adaptSchema(SCHEMA));
+  if (!columnExists('notices', 'class_id')) sqlite.exec('ALTER TABLE notices ADD COLUMN class_id INTEGER');
   if (process.env.YIZUOYE_RESET === '1') {
     process.env.YIZUOYE_RESET = '0';
     await resetDemo(null);
@@ -312,6 +454,7 @@ async function migrateAndSeed() {
   }
   const count = await one('SELECT COUNT(*) AS n FROM users');
   if (Number(count?.n || 0) === 0) await transaction(seedContent);
+  await repairExistingData();
 }
 
 export async function closeStores() {
@@ -430,11 +573,85 @@ export async function importRoster(classId, text) {
         added += 1;
       }
     }
-    const rosterCount = (await one('SELECT COUNT(*)::int AS n FROM roster WHERE class_id=$1', [course.id])).n;
-    const declared = Math.max(course.declared_count || 0, rosterCount);
-    await q('UPDATE classes SET declared_count=$1 WHERE id=$2', [declared, course.id]);
+    const rosterCount = (await one('SELECT COUNT(*) AS n FROM roster WHERE class_id=$1', [course.id])).n;
+    await q('UPDATE classes SET declared_count=$1 WHERE id=$2', [rosterCount, course.id]);
   });
   return { added, message: `已保存 ${added} 名学生名单，重复学号已跳过` };
+}
+
+export async function updateClass({ id, name, startDate, endDate }) {
+  const course = await one('SELECT * FROM classes WHERE id=$1', [Number(id)]);
+  if (!course) throw new HttpError(404, '班级不存在');
+  const title = String(name || '').trim().slice(0, 80);
+  if (!title) throw new HttpError(400, '请填写课程名称');
+  const start = String(startDate || '').trim();
+  const end = String(endDate || '').trim();
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  if (start && !datePattern.test(start)) throw new HttpError(400, '课程开始日期不正确');
+  if (end && !datePattern.test(end)) throw new HttpError(400, '课程结束日期不正确');
+  if (start && end && end < start) throw new HttpError(400, '课程结束日期不能早于开始日期');
+  await q('UPDATE classes SET name=$1, course=$1, start_date=$2, end_date=$3 WHERE id=$4', [title, start, end, course.id]);
+}
+
+async function deleteStoredIds(rows) {
+  for (const row of rows) unlinkStored(row.id);
+}
+
+export async function deleteClass(classId) {
+  const course = await one('SELECT * FROM classes WHERE id=$1', [Number(classId)]);
+  if (!course) throw new HttpError(404, '班级不存在');
+  const removed = [];
+  await transaction(async () => {
+    const tasks = await many('SELECT id FROM tasks WHERE class_id=$1', [course.id]);
+    const submissions = [];
+    for (const task of tasks) submissions.push(...await many('SELECT id FROM submissions WHERE task_id=$1', [task.id]));
+    const attendance = await many('SELECT id FROM attendance WHERE class_id=$1', [course.id]);
+    removed.push(...await many(`SELECT id FROM files WHERE kind='courseware' AND ref_id=$1`, [String(course.id)]));
+    for (const task of tasks) {
+      removed.push(...await many(`SELECT id FROM files WHERE kind IN ('task','task-audio') AND ref_id=$1`, [String(task.id)]));
+    }
+    for (const submission of submissions) {
+      removed.push(...await many(`SELECT id FROM files WHERE kind='submission' AND ref_id=$1`, [String(submission.id)]));
+    }
+    for (const row of attendance) await q('DELETE FROM checkins WHERE attendance_id=$1', [row.id]);
+    for (const submission of submissions) await q(`DELETE FROM files WHERE kind='submission' AND ref_id=$1`, [String(submission.id)]);
+    for (const task of tasks) {
+      await q(`DELETE FROM files WHERE kind IN ('task','task-audio') AND ref_id=$1`, [String(task.id)]);
+      await q('DELETE FROM submissions WHERE task_id=$1', [task.id]);
+    }
+    await q(`DELETE FROM files WHERE kind='courseware' AND ref_id=$1`, [String(course.id)]);
+    await q('DELETE FROM tasks WHERE class_id=$1', [course.id]);
+    await q('DELETE FROM courseware WHERE class_id=$1', [course.id]);
+    await q('DELETE FROM attendance WHERE class_id=$1', [course.id]);
+    await q('DELETE FROM roster WHERE class_id=$1', [course.id]);
+    await q('DELETE FROM notices WHERE class_id=$1', [course.id]);
+    await q('DELETE FROM classes WHERE id=$1', [course.id]);
+  });
+  await deleteStoredIds(removed);
+}
+
+export async function removeRosterStudent(classId, account) {
+  const course = await one('SELECT * FROM classes WHERE id=$1', [Number(classId)]);
+  if (!course) throw new HttpError(404, '班级不存在');
+  const student = await one(`SELECT * FROM users WHERE account=$1 AND role='student'`, [String(account || '').trim()]);
+  if (!student) throw new HttpError(404, '未找到该学生');
+  const linked = await one('SELECT 1 AS ok FROM roster WHERE class_id=$1 AND student_id=$2', [course.id, student.id]);
+  if (!linked) throw new HttpError(404, '该学生不在这个班级');
+  await q('DELETE FROM roster WHERE class_id=$1 AND student_id=$2', [course.id, student.id]);
+  const rosterCount = (await one('SELECT COUNT(*) AS n FROM roster WHERE class_id=$1', [course.id])).n;
+  await q('UPDATE classes SET declared_count=$1 WHERE id=$2', [rosterCount, course.id]);
+}
+
+export async function resetStudentPassword(classId, account, password) {
+  const course = await one('SELECT id FROM classes WHERE id=$1', [Number(classId)]);
+  if (!course) throw new HttpError(404, '班级不存在');
+  const student = await one(`SELECT * FROM users WHERE account=$1 AND role='student'`, [String(account || '').trim()]);
+  if (!student) throw new HttpError(404, '未找到该学生');
+  const linked = await one('SELECT 1 AS ok FROM roster WHERE class_id=$1 AND student_id=$2', [course.id, student.id]);
+  if (!linked) throw new HttpError(404, '该学生不在这个班级');
+  const next = String(password || '').trim();
+  if (next.length < 3) throw new HttpError(400, '新密码至少 3 位');
+  await q('UPDATE users SET password_hash=$1 WHERE id=$2', [hashPassword(next), student.id]);
 }
 
 function originalFallback(upload) {
@@ -448,6 +665,12 @@ export async function createTask({ classId, title, week, sections, points, deadl
   const taskTitle = String(title || '').trim().slice(0, 120) || '课堂作业';
   const stored = [];
   let taskId = 0;
+  const originals = [];
+  const audios = [];
+  for (const upload of uploads || []) {
+    if (/^audio_\d+$/.test(upload.fieldname || '')) audios.push(upload);
+    else originals.push(upload);
+  }
   try {
     await transaction(async () => {
       const row = await one(`INSERT INTO tasks(class_id, title, week, sections_json, points, deadline, types, notes, created_at)
@@ -456,21 +679,24 @@ export async function createTask({ classId, title, week, sections, points, deadl
         taskTitle,
         Number.isFinite(Number(week)) ? Number(week) : 0,
         JSON.stringify(normalized),
-        Math.max(0, Number(points) || 0),
+        Math.max(1, Math.round(Number(points) || 1)),
         String(deadline || ''),
         String(types || '').slice(0, 80),
         String(notes || '').slice(0, 4000),
       ]);
       taskId = row.id;
-      for (const [index, upload] of (uploads || []).entries()) {
+      for (const [index, upload] of originals.entries()) {
         const file = await insertFile({
           kind: 'task',
           refId: taskId,
           upload,
-          name: names[index] || originalFallback(upload),
+          name: originalFallback(upload),
         });
         stored.push(file.id);
       }
+      const audio = await attachSectionAudio(normalized, audios, taskId);
+      stored.push(...audio.created);
+      if (audio.created.length) await q('UPDATE tasks SET sections_json=$1 WHERE id=$2', [JSON.stringify(normalized), taskId]);
       await addNotice(`教师发布了新作业：${taskTitle}`);
     });
   } catch (error) {
@@ -480,6 +706,69 @@ export async function createTask({ classId, title, week, sections, points, deadl
   return taskId;
 }
 
+function taskFields({ title, week, sections, points, deadline, types, notes }) {
+  return [
+    String(title || '').trim().slice(0, 120) || '课堂作业',
+    Number.isFinite(Number(week)) ? Number(week) : 0,
+    Math.max(1, Math.round(Number(points) || 1)),
+    String(deadline || ''),
+    String(types || '').slice(0, 80),
+    String(notes || '').slice(0, 4000),
+    sections,
+  ];
+}
+
+async function attachSectionAudio(sections, audios, taskId) {
+  const created = [];
+  const replaced = [];
+  for (const upload of audios) {
+    const index = Number(upload.fieldname.slice('audio_'.length));
+    if (!sections[index]) continue;
+    const previous = String(sections[index].audio || '');
+    const oldId = previous.startsWith('/api/files/') ? previous.slice('/api/files/'.length) : '';
+    const file = await insertFile({
+      kind: 'task-audio',
+      refId: taskId,
+      upload,
+      name: originalFallback(upload),
+    });
+    created.push(file.id);
+    sections[index].audio = `/api/files/${file.id}`;
+    if (oldId) {
+      const old = await one(`SELECT id FROM files WHERE id=$1 AND kind='task-audio' AND ref_id=$2`, [oldId, String(taskId)]);
+      if (old) {
+        await q('DELETE FROM files WHERE id=$1', [old.id]);
+        replaced.push(old.id);
+      }
+    }
+  }
+  return { created, replaced };
+}
+
+export async function updateTask({ taskId, title, week, sections, points, deadline, types, notes, uploads }) {
+  const task = await one('SELECT * FROM tasks WHERE id=$1', [Number(taskId)]);
+  if (!task) throw new HttpError(404, '未找到该作业，请刷新页面后重试');
+  const normalized = normalizeSections(sections);
+  const [taskTitle, weekNumber, reward, due, typeText, noteText] = taskFields({ title, week, points, deadline, types, notes, sections: normalized });
+  const audios = (uploads || []).filter((upload) => /^audio_\d+$/.test(upload.fieldname || ''));
+  let created = [];
+  let replaced = [];
+  try {
+    await transaction(async () => {
+      const audio = await attachSectionAudio(normalized, audios, task.id);
+      created = audio.created;
+      replaced = audio.replaced;
+      await q(`UPDATE tasks SET title=$1, week=$2, sections_json=$3, points=$4, deadline=$5, types=$6, notes=$7 WHERE id=$8`, [
+        taskTitle, weekNumber, JSON.stringify(normalized), reward, due, typeText, noteText, task.id,
+      ]);
+    });
+  } catch (error) {
+    for (const id of created) unlinkStored(id);
+    throw error;
+  }
+  for (const id of replaced) unlinkStored(id);
+}
+
 export async function deleteTask(taskId) {
   const task = await one('SELECT * FROM tasks WHERE id=$1', [Number(taskId)]);
   if (!task) throw new HttpError(404, '未找到该作业，请刷新页面后重试');
@@ -487,10 +776,10 @@ export async function deleteTask(taskId) {
   await transaction(async () => {
     const submissions = await many('SELECT id FROM submissions WHERE task_id=$1', [task.id]);
     const fileRows = [
-      ...await many(`SELECT id FROM files WHERE kind='task' AND ref_id=$1`, [String(task.id)]),
+      ...await many(`SELECT id FROM files WHERE kind IN ('task', 'task-audio') AND ref_id=$1`, [String(task.id)]),
       ...(await Promise.all(submissions.map((submission) => many(`SELECT id FROM files WHERE kind='submission' AND ref_id=$1`, [String(submission.id)])))).flat(),
     ];
-    await q(`DELETE FROM files WHERE kind='task' AND ref_id=$1`, [String(task.id)]);
+    await q(`DELETE FROM files WHERE kind IN ('task', 'task-audio') AND ref_id=$1`, [String(task.id)]);
     for (const submission of submissions) await q(`DELETE FROM files WHERE kind='submission' AND ref_id=$1`, [String(submission.id)]);
     await q('DELETE FROM submissions WHERE task_id=$1', [task.id]);
     await q('DELETE FROM tasks WHERE id=$1', [task.id]);
@@ -506,10 +795,23 @@ export async function deleteTaskFile(taskId, fileId) {
   unlinkStored(file.id);
 }
 
+function pastDeadline(deadline) {
+  const text = String(deadline || '').trim();
+  if (!text) return false;
+  const time = new Date(text).getTime();
+  return Number.isFinite(time) && Date.now() > time;
+}
+
+function rewardPoints(task) {
+  const points = Math.round(Number(task.points));
+  return Number.isFinite(points) && points > 0 ? points : 1;
+}
+
 export async function createSubmission({ taskId, student, parts, uploads }) {
   const task = await one('SELECT * FROM tasks WHERE id=$1', [Number(taskId)]);
   if (!task) throw new HttpError(404, '作业不存在');
   if (student.role !== 'student') throw new HttpError(403, '只有学生可以提交作业');
+  if (pastDeadline(task.deadline)) throw new HttpError(400, '已过截止时间，不能提交或修改');
   const sections = JSON.parse(task.sections_json);
   const answers = Array.isArray(parts) ? parts : [];
   if (answers.length !== sections.length) throw new HttpError(400, '请完成全部题目');
@@ -527,23 +829,36 @@ export async function createSubmission({ taskId, student, parts, uploads }) {
     return { title: section.title || `第${index + 1}题`, answer, pending: files };
   });
   let autoScore = '';
+  let replaced = false;
   const stored = [];
+  const removed = [];
+  const gained = rewardPoints(task);
   try {
     await transaction(async () => {
-      const existing = await one('SELECT id FROM submissions WHERE task_id=$1 AND student_id=$2', [task.id, student.id]);
-      if (existing) throw new HttpError(400, '该作业已提交，请勿重复提交');
       const graded = grade(sections, storedParts);
       autoScore = graded.autoScore;
       const answerText = storedParts.map((part, index) => `第${index + 1}题：${part.answer || '（附件）'}`).join('\n');
-      const row = await one(`INSERT INTO submissions(task_id, student_id, answer, parts_json, file_names, status, auto_score, feedback, created_at)
-        VALUES ($1, $2, $3, '[]', '', '待批改', $4, '', NOW()) RETURNING id`, [task.id, student.id, answerText, autoScore]);
+      const existing = await one('SELECT id FROM submissions WHERE task_id=$1 AND student_id=$2', [task.id, student.id]);
+      let submissionId = existing?.id;
+      if (existing) {
+        replaced = true;
+        removed.push(...await many(`SELECT id FROM files WHERE kind='submission' AND ref_id=$1`, [String(existing.id)]));
+        await q(`DELETE FROM files WHERE kind='submission' AND ref_id=$1`, [String(existing.id)]);
+        await q(`UPDATE submissions SET answer=$1, parts_json='[]', file_names='', status='待批改', auto_score=$2, feedback='' WHERE id=$3`, [
+          answerText, autoScore, existing.id,
+        ]);
+      } else {
+        const row = await one(`INSERT INTO submissions(task_id, student_id, answer, parts_json, file_names, status, auto_score, feedback, created_at)
+          VALUES ($1, $2, $3, '[]', '', '待批改', $4, '', NOW()) RETURNING id`, [task.id, student.id, answerText, autoScore]);
+        submissionId = row.id;
+      }
       const finalParts = [];
       for (const part of storedParts) {
         const files = [];
         for (const upload of part.pending) {
           const file = await insertFile({
             kind: 'submission',
-            refId: row.id,
+            refId: submissionId,
             userId: student.id,
             upload,
             name: originalFallback(upload),
@@ -554,16 +869,25 @@ export async function createSubmission({ taskId, student, parts, uploads }) {
         finalParts.push({ title: part.title, answer: part.answer, files });
       }
       const fileNames = finalParts.flatMap((part) => part.files.map((file) => file.name)).join('、');
-      await q('UPDATE submissions SET parts_json=$1, file_names=$2 WHERE id=$3', [JSON.stringify(finalParts), fileNames, row.id]);
-      await q('UPDATE users SET points = points + 1 WHERE id=$1', [student.id]);
-      await addNotice('作业提交成功，获得1积分');
+      await q('UPDATE submissions SET parts_json=$1, file_names=$2 WHERE id=$3', [JSON.stringify(finalParts), fileNames, submissionId]);
+      if (!replaced) {
+        await q('UPDATE users SET points = points + $1 WHERE id=$2', [gained, student.id]);
+        await addNotice(`作业提交成功，获得${gained}积分`);
+      } else {
+        await addNotice('作业已修改，请等待教师重新批改');
+      }
     });
   } catch (error) {
     for (const id of stored) unlinkStored(id);
-    if (error.code === '23505') throw new HttpError(400, '该作业已提交，请勿重复提交');
+    if (error.code === '23505') throw new HttpError(400, '该作业已提交，请在截止前修改');
     throw error;
   }
-  return { message: autoScore ? `全部题目提交成功，积分+1，客观题得分 ${autoScore}` : '全部题目提交成功，积分+1' };
+  for (const row of removed) unlinkStored(row.id);
+  const scoreText = autoScore ? `，客观题得分 ${autoScore}` : '';
+  return {
+    replaced,
+    message: replaced ? `已更新提交，不重复加分${scoreText}` : `全部题目提交成功，积分+${gained}${scoreText}`,
+  };
 }
 
 function grade(sections, parts) {
