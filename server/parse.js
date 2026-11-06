@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import zlib from 'node:zlib';
 import mammoth from 'mammoth';
 import ExcelJS from 'exceljs';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
@@ -161,8 +162,14 @@ export async function extractBuffer(buffer, filename, mime = '') {
     }
   }
   if (/\.(xlsx|xlsm)$/i.test(name)) return extractXlsx(buffer);
-  if (/\.xls$/i.test(name)) throw new Error('请将旧版 .xls 另存为 .xlsx 或 CSV');
-  if (/\.doc$/i.test(name)) throw new Error('请将旧版 .doc 另存为 .docx，或把文字粘贴到输入框');
+  if (/\.xls$/i.test(name)) return extractXlsx(await convertOffice(buffer, filename || 'roster.xls', 'xlsx'));
+  if (/\.doc$/i.test(name)) {
+    const converted = await convertOffice(buffer, filename || 'paper.doc', 'docx');
+    const result = await mammoth.extractRawText({ buffer: converted });
+    return result.value || '';
+  }
+  if (/\.pptx$/i.test(name)) return extractPptx(buffer);
+  if (/\.ppt$/i.test(name)) return extractPptx(await convertOffice(buffer, filename || 'slides.ppt', 'pptx'));
   if (/\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(name) || type.startsWith('image/')) {
     const suffix = path.extname(name) || '.png';
     try {
@@ -194,6 +201,13 @@ export function splitTeacherQuestions(raw) {
   return parts.filter((part) => part.content || part.title);
 }
 
+function answerToken(raw) {
+  const text = String(raw || '').trim();
+  const compact = text.replace(/[\s,，、.．]/g, '').toUpperCase();
+  if (/^[A-F]{1,6}$/.test(compact)) return { value: [...new Set(compact)].join(''), multiple: new Set(compact).size > 1 };
+  return { value: text.slice(0, 40), multiple: false };
+}
+
 export function parseSmartAssignment(raw) {
   const normalized = String(raw || '').replace(/\r/g, '').trim();
   const answerStart = normalized.search(/(?:^|\n)\s*(?:参考答案|标准答案|答案汇总|答案与解析|Answer Key|Answers)\s*[：:\n]/im);
@@ -202,8 +216,8 @@ export function parseSmartAssignment(raw) {
   const parts = splitTeacherQuestions(body);
   const answers = {};
   for (const line of answerText.split('\n')) {
-    const matches = line.matchAll(/(?:第\s*)?(\d{1,3})\s*(?:题)?\s*[.．、:：)）=\-]?\s*([A-Da-d](?:\s*[,，、]\s*[A-Da-d])*|[^\s,，;；]{1,20})(?=\s|$|[,，;；])/g);
-    for (const matched of matches) answers[Number(matched[1])] = matched[2].toUpperCase();
+    const matches = line.matchAll(/(?:第\s*)?(\d{1,3})\s*题?\s*[.．、:：)）=\-]?\s*([A-Fa-f](?:[\s,，、]*[A-Fa-f])*|[^\s,，;；]{1,40})/g);
+    for (const matched of matches) answers[Number(matched[1])] = answerToken(matched[2]);
   }
   return parts.map((part, index) => {
     let content = part.content.trim();
@@ -213,15 +227,91 @@ export function parseSmartAssignment(raw) {
       options = optionMatches.map((matched) => matched[2].trim());
       content = content.slice(0, optionMatches[0].index).trim();
     }
+    const answer = answers[index + 1] || { value: '', multiple: false };
+    const multiple = answer.multiple || /多选|多项选择|选出所有|选择所有/.test(content);
     const type = options.length >= 2
-      ? 'single'
+      ? (multiple ? 'multiple' : 'single')
       : /(?:听录音|听力|听一听|听后)/.test(content)
         ? 'listening'
         : /(?:_{2,}|＿{2,}|（\s*）|\(\s*\)|填空)/.test(content)
           ? 'blank'
           : 'writing';
-    return { ...part, content, type, options, correct: answers[index + 1] || '' };
+    return { ...part, content, type, options, correct: answer.value || '' };
   });
+}
+
+function decodeXml(value) {
+  return String(value || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function readZipEntries(buffer) {
+  const entries = new Map();
+  let offset = 0;
+  while (offset + 30 <= buffer.length && buffer.readUInt32LE(offset) === 0x04034b50) {
+    const method = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const nameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const name = buffer.subarray(offset + 30, offset + 30 + nameLength).toString('utf8');
+    const start = offset + 30 + nameLength + extraLength;
+    const end = start + compressedSize;
+    if (!compressedSize || end > buffer.length) break;
+    const compressed = buffer.subarray(start, end);
+    const content = method === 0 ? compressed : method === 8 ? zlib.inflateRawSync(compressed) : null;
+    if (content) entries.set(name, content);
+    offset = end;
+  }
+  return entries;
+}
+
+function extractPptx(buffer) {
+  const entries = readZipEntries(buffer);
+  const slides = [...entries.keys()]
+    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
+    .sort((left, right) => Number(left.match(/\d+/)[0]) - Number(right.match(/\d+/)[0]));
+  const text = slides.map((name) => [...entries.get(name).toString('utf8').matchAll(/<a:t[^>]*>([^<]*)<\/a:t>/g)]
+    .map((matched) => decodeXml(matched[1])).join('')).filter(Boolean).join('\n');
+  if (!text.trim()) throw new Error('没有读到幻灯片中的文字，请把题目粘贴到输入框');
+  return text;
+}
+
+async function officeBinary() {
+  for (const name of ['soffice', 'libreoffice']) {
+    try {
+      await execFileAsync('bash', ['-lc', `command -v ${name}`], { timeout: 4000 });
+      return name;
+    } catch { /* try the next name */ }
+  }
+  return '';
+}
+
+async function convertOffice(buffer, filename, target) {
+  const binary = await officeBinary();
+  if (!binary) {
+    throw new Error(target === 'docx'
+      ? '请将旧版 .doc 另存为 .docx，或安装 LibreOffice 后重试'
+      : target === 'xlsx'
+        ? '请将旧版 .xls 另存为 .xlsx 或 CSV，或安装 LibreOffice 后重试'
+        : '请将旧版 .ppt 另存为 .pptx，或安装 LibreOffice 后重试');
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yizuoye-office-'));
+  const safeName = path.basename(String(filename || `paper.${target}`)).replace(/[^\w.\-\u4e00-\u9fff]/g, '_') || `paper.${target}`;
+  const input = path.join(dir, safeName);
+  try {
+    await fs.writeFile(input, buffer);
+    await execFileAsync(binary, ['--headless', '--convert-to', target, '--outdir', dir, input], { timeout: 90000 });
+    const output = input.replace(/\.[^.]+$/, `.${target}`);
+    return await fs.readFile(output);
+  } catch (error) {
+    throw new Error(`旧版 Office 文件转换失败：${commandFailure(error)}`);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }
 
 export function recognizeAssignment(raw) {
@@ -254,6 +344,13 @@ export function parseRoster(text) {
 
 const QUESTION_TYPES = new Set(['single', 'multiple', 'blank', 'writing', 'listening']);
 
+function choiceAnswer(type, correct) {
+  const raw = String(correct || '').trim();
+  if (type !== 'single' && type !== 'multiple') return raw.slice(0, 200);
+  const letters = raw.toUpperCase().match(/[A-F]/g);
+  return letters?.length ? [...new Set(letters)].join('').slice(0, 200) : raw.slice(0, 200);
+}
+
 export function normalizeSections(input) {
   let sections = input;
   if (typeof sections === 'string') {
@@ -263,11 +360,13 @@ export function normalizeSections(input) {
   return sections.slice(0, 200).map((section, index) => ({
     title: String(section?.title || `第${index + 1}题`).slice(0, 200),
     content: String(section?.content || '').slice(0, 20000),
-    type: QUESTION_TYPES.has(section?.type) ? section.type : 'writing',
+    type: QUESTION_TYPES.has(section?.type)
+      ? ((section.type === 'single' && choiceAnswer('multiple', section?.correct).length > 1) ? 'multiple' : section.type)
+      : 'writing',
     options: Array.isArray(section?.options)
       ? section.options.map((option) => String(option).trim().slice(0, 500)).filter(Boolean).slice(0, 8)
       : [],
-    correct: String(section?.correct || '').slice(0, 200),
+    correct: choiceAnswer(section?.type, section?.correct),
     audio: String(section?.audio || '').slice(0, 1000),
   }));
 }

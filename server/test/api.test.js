@@ -161,6 +161,20 @@ D. 深圳
   assert.equal(sections[1].correct, '');
 });
 
+test('多选题按多个选项字母识别', () => {
+  const sections = recognizeAssignment(`1. 选出北方的城市（多选）
+A. 北京
+B. 上海
+C. 哈尔滨
+D. 广州
+
+参考答案
+1. A、C
+`).sections;
+  assert.equal(sections[0].type, 'multiple');
+  assert.equal(sections[0].correct, 'AC');
+});
+
 test('同机 API 覆盖登录、作业、签到、积分和文件', async () => {
   const { createApp } = await import('../index.js');
   server = createApp().listen(0, '127.0.0.1');
@@ -189,6 +203,8 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   assert.equal(state.classes[0].name, 'HSK三级提高班');
   assert.equal(state.classes[0].students, 28);
   assert.equal(state.notices[0], '欢迎使用易作业！');
+  assert.equal(state.tasks[0].points, 1);
+  assert.equal(state.resources.find((item) => item.name === 'HSK三级词汇表.pdf').hasFile, true);
   assert.equal(state.tasks[0].sections[0].correct, '');
 
   expect(await teacher('POST', '/api/auth/register', { json: { role: 'student', account: '2026888', name: '新同学', password: '12345' } }), 400);
@@ -233,6 +249,15 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   const pdf = expect(await teacher('POST', '/api/tasks/extract', { form: pdfForm }), 200);
   assert.match(pdf.files[0].text, /Hello Beijing/);
 
+  const slide = `<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>1. 中国的首都是北京</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>`;
+  const pptxForm = new FormData();
+  pptxForm.append('files', new Blob([zipStore([['ppt/slides/slide1.xml', slide]])], {
+    type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  }), '课件.pptx');
+  const slides = expect(await teacher('POST', '/api/tasks/extract', { form: pptxForm }), 200);
+  assert.match(slides.files[0].text, /首都是北京/);
+
   const image = fs.readFileSync(new URL('./fixtures/question.png', import.meta.url));
   const imageForm = new FormData();
   imageForm.append('files', new Blob([image], { type: 'image/png' }), 'question.png');
@@ -262,7 +287,17 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   assert.equal(task.attachments[0].name, '作业原文.txt');
   const classOne = taught.classes.find((item) => item.id === 1);
   assert.equal(classOne.roster.length, 2);
-  assert.equal(classOne.students, 28);
+  assert.equal(classOne.students, 2);
+  expect(await teacher('POST', '/api/classes/1/roster/2026003/password', { json: { password: 'secret9' } }), 200);
+  const wang = client(base);
+  expect(await wang('POST', '/api/auth/login', { json: { role: 'student', account: '2026003', name: '王五', password: 'secret9' } }), 200);
+  expect(await teacher('DELETE', '/api/classes/1/roster/2026003'), 200);
+  const afterRemove = expect(await teacher('GET', '/api/state'), 200);
+  const trimmed = afterRemove.classes.find((item) => item.id === 1);
+  assert.equal(trimmed.roster.length, 1);
+  assert.equal(trimmed.students, 1);
+  expect(await teacher('POST', '/api/notices', { json: { classId: 1, body: '明天小测' } }), 200);
+  expect(await teacher('PATCH', '/api/classes/3', { json: { name: '汉语写作提高班', startDate: '2026-11-06', endDate: '2027-01-20' } }), 200);
 
   expect(await teacher('POST', '/api/messages', { json: { body: '请按时完成首都测验。' } }), 200);
   expect(await teacher('POST', '/api/classes/1/courseware', { form: (() => {
@@ -310,8 +345,25 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   }
   const submitted = expect(await zhang('POST', `/api/tasks/${task.id}/submissions`, { form: submissionForm() }), 200);
   assert.match(submitted.message, /客观题得分 2\/2/);
+  assert.match(submitted.message, /积分\+1/);
   assert.equal(expect(await zhang('GET', '/api/state'), 200).points, 18);
-  expect(await zhang('POST', `/api/tasks/${task.id}/submissions`, { form: submissionForm() }), 400);
+  assert.equal(expect(await zhang('GET', '/api/state'), 200).notices.some((item) => item.includes('明天小测')), false);
+  const revised = expect(await zhang('POST', `/api/tasks/${task.id}/submissions`, { form: submissionForm() }), 200);
+  assert.match(revised.message, /不重复加分/);
+  assert.equal(expect(await zhang('GET', '/api/state'), 200).points, 18);
+  const lateForm = new FormData();
+  lateForm.append('title', '已过期作业');
+  lateForm.append('week', '1');
+  lateForm.append('deadline', '2020-01-01T00:00');
+  lateForm.append('types', '文档');
+  lateForm.append('notes', '');
+  lateForm.append('points', '1');
+  lateForm.append('sections', JSON.stringify([{ title: '第1题', content: '写一句', type: 'writing', options: [], correct: '', audio: '' }]));
+  expect(await teacher('POST', '/api/classes/1/tasks', { form: lateForm }), 200);
+  const lateTask = expect(await teacher('GET', '/api/state'), 200).tasks.find((item) => item.title === '已过期作业');
+  const lateAnswer = new FormData();
+  lateAnswer.append('parts', JSON.stringify([{ answer: '来不及了' }]));
+  expect(await zhang('POST', `/api/tasks/${lateTask.id}/submissions`, { form: lateAnswer }), 400);
   const checked = expect(await zhang('POST', `/api/attendance/${openAttendance.id}/checkin`, { json: { makeup: false } }), 200);
   assert.match(checked.message, /签到成功/);
   expect(await zhang('POST', `/api/attendance/${openAttendance.id}/checkin`, { json: { makeup: false } }), 400);
@@ -332,6 +384,7 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   expect(await li('POST', '/api/auth/login', { json: { role: 'student', account: '2026002', name: '李四', password: '123' } }), 200);
   const liState = expect(await li('GET', '/api/state'), 200);
   assert.equal(liState.points, 1);
+  assert.equal(liState.notices.some((item) => item.includes('明天小测')), true);
   assert.equal(liState.submissions.length, 0);
   assert.equal('correct' in liState.tasks.find((item) => item.title === '首都测验').sections[0], false);
   const secretFile = afterRedeem.submissions[0].parts[1].files[0].id;
@@ -355,6 +408,24 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   expect(await teacher('GET', '/api/files/not-a-file'), 404);
   expect(await teacher('DELETE', `/api/tasks/${task.id}/files/${task.attachments[0].id}`), 200);
   assert.equal(expect(await teacher('GET', '/api/state'), 200).tasks.find((item) => item.id === task.id).attachments.length, 0);
+  const edited = new FormData();
+  edited.append('title', '首都测验（修订）');
+  edited.append('week', '3');
+  edited.append('deadline', '2026-12-21T23:59');
+  edited.append('types', '文档');
+  edited.append('notes', '已改截止时间');
+  edited.append('points', '1');
+  edited.append('sections', JSON.stringify([
+    { title: '第1题', content: '中国的首都是哪里？', type: 'single', options: ['上海', '北京', '广州', '深圳'], correct: 'B', audio: '' },
+    { title: '第2题', content: '听录音并填空 ____', type: 'blank', options: [], correct: '北京', audio: '' },
+  ]));
+  expect(await teacher('PUT', `/api/tasks/${task.id}`, { form: edited }), 200);
+  const renamed = expect(await teacher('GET', '/api/state'), 200).tasks.find((item) => item.id === task.id);
+  assert.equal(renamed.title, '首都测验（修订）');
+  assert.equal(renamed.deadline, '2026-12-21T23:59');
+  const writingClass = expect(await teacher('GET', '/api/state'), 200).classes.find((item) => item.name === '汉语写作提高班');
+  expect(await teacher('DELETE', `/api/classes/${writingClass.id}`), 200);
+  assert.equal(expect(await teacher('GET', '/api/state'), 200).classes.some((item) => item.id === writingClass.id), false);
   expect(await teacher('DELETE', `/api/tasks/${task.id}`), 200);
   assert.equal(expect(await teacher('GET', '/api/state'), 200).tasks.some((item) => item.id === task.id), false);
   assert.equal(expect(await zhang('GET', '/api/state'), 200).submissions.length, 0);
