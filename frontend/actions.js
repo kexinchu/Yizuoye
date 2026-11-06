@@ -2,7 +2,7 @@ Object.assign(UI_TRANSLATIONS, {
   "课件文件保存在本机服务器，同一台电脑上的浏览器都可以下载。": ["تُحفظ ملفات الدروس على خدمة هذا الجهاز.", "Les fichiers de cours sont enregistrés sur cet ordinateur.", "Course files are stored on this computer."],
   "文件保存在本机服务器。": ["تُحفظ الملفات على هذا الجهاز.", "Les fichiers sont enregistrés sur cet ordinateur.", "Files are stored on this computer."],
   "服务会读取 TXT、CSV、Excel、Word、PDF 和图片，扫描件由本机文字识别处理，旧版 DOC / XLS 请先另存。": ["يقرأ TXT وCSV وExcel وWord وPDF والصور، ويتعرف على المسح محليًا.", "TXT, CSV, Excel, Word, PDF et images sont lus ; le scan est reconnu sur cet ordinateur.", "TXT, CSV, Excel, Word, PDFs, and images are read; scans are recognized on this computer."],
-  "支持读取 DOCX、PDF、TXT、Excel 和图片并自动分题；扫描件由本机文字识别处理，旧版 DOC 请另存。识别结果请教师核对。": ["يمكن قراءة DOCX وPDF وTXT وExcel والصور وتقسيم الأسئلة؛ يُتعرف على المسح محليًا.", "DOCX, PDF, TXT, Excel et images sont lus et découpés ; le scan est reconnu ici.", "DOCX, PDF, TXT, Excel, and images are read and split; scans are recognized on this computer."],
+  "支持读取 DOCX、PDF、PPTX、TXT、Excel 和图片并自动分题；扫描件由本机文字识别处理。旧版 DOC、XLS、PPT 在安装 LibreOffice 后会自动转换，否则请另存。多选题请在答案里写两个以上字母。识别结果请教师核对。": ["يمكن قراءة DOCX وPDF وPPTX وTXT وExcel والصور وتقسيم الأسئلة.", "DOCX, PDF, PPTX, TXT, Excel et images sont lus et découpés.", "DOCX, PDF, PPTX, TXT, Excel, and images are read and split."],
   "修改密码": ["تغيير كلمة المرور", "Changer le mot de passe", "Change Password"],
   "当前密码": ["كلمة المرور الحالية", "Mot de passe actuel", "Current Password"],
   "新密码": ["كلمة المرور الجديدة", "Nouveau mot de passe", "New Password"],
@@ -209,12 +209,88 @@ async function publishTask() {
   form.append("points", $("reward").value);
   form.append("sections", JSON.stringify(sections));
   [...($("teacherTaskFiles")?.files || [])].forEach((file) => form.append("files", file));
+  cards.forEach((card, index) => {
+    const audio = card.querySelector(".qaudiofile")?.files?.[0];
+    if (audio) form.append("audio_" + index, audio);
+  });
   try {
     await api("/api/classes/" + encodeURIComponent(currentClass) + "/tasks", { method: "POST", body: form });
     await loadState();
     closeModal();
     render();
     notify("作业发布成功");
+  } catch (error) { notify(error.message); }
+}
+
+function editTask(id) {
+  window.editingTaskId = id;
+  newTask();
+}
+
+function fillTaskEditor(id) {
+  const task = data.tasks.find((item) => String(item.id) === String(id));
+  if (!task) return;
+  $("modaltitle").textContent = "修改作业";
+  if ($("smartTaskTitle")) $("smartTaskTitle").value = task.title || "";
+  if ($("taskweek")) $("taskweek").value = String(task.week || 0);
+  if ($("deadline")) $("deadline").value = task.deadline || "";
+  if ($("types")) {
+    const select = $("types");
+    if (task.types && ![...select.options].some((option) => option.value === task.types)) {
+      const option = document.createElement("option");
+      option.value = task.types;
+      option.textContent = task.types;
+      select.appendChild(option);
+    }
+    select.value = task.types || "";
+  }
+  if ($("notes")) $("notes").value = task.notes || "";
+  if ($("reward")) $("reward").value = task.points || 1;
+  if ($("sections")) $("sections").innerHTML = (task.sections || []).map(smartQuestionEditor).join("");
+  const button = document.querySelector("#modalbody button.primary");
+  if (button) {
+    button.textContent = "保存修改";
+    button.dataset.taskId = String(id);
+    button.setAttribute("onclick", "saveTaskEdit()");
+  }
+}
+
+function taskForm() {
+  const cards = [...document.querySelectorAll("#sections > .field")];
+  const sections = cards.map((card, index) => ({
+    title: card.querySelector(".st")?.value || ("题目" + (index + 1)),
+    content: card.querySelector(".sc")?.value || "",
+    type: card.querySelector(".qtype")?.value || "writing",
+    options: [...card.querySelectorAll(".qoption")].map((input) => input.value.trim()).filter(Boolean),
+    correct: card.querySelector(".qcorrect")?.value.trim() || "",
+    audio: card.querySelector(".qaudio")?.value || ""
+  }));
+  const form = new FormData();
+  form.append("title", $("smartTaskTitle")?.value.trim() || "课堂作业");
+  form.append("week", $("taskweek").value);
+  form.append("deadline", $("deadline").value);
+  form.append("types", $("types").value);
+  form.append("notes", $("notes").value);
+  form.append("points", $("reward").value);
+  form.append("sections", JSON.stringify(sections));
+  cards.forEach((card, index) => {
+    const audio = card.querySelector(".qaudiofile")?.files?.[0];
+    if (audio) form.append("audio_" + index, audio);
+  });
+  return form;
+}
+
+async function saveTaskEdit() {
+  const id = document.querySelector("#modalbody button.primary")?.dataset.taskId;
+  if (!id) return notify("找不到要修改的作业");
+  const cards = [...document.querySelectorAll("#sections > .field")];
+  if (!cards.length) return notify("请至少保留一道题");
+  try {
+    await api("/api/tasks/" + encodeURIComponent(id), { method: "PUT", body: taskForm() });
+    await loadState();
+    closeModal();
+    render();
+    notify("作业已更新");
   } catch (error) { notify(error.message); }
 }
 
@@ -246,6 +322,137 @@ async function doSubmit(taskId) {
     render();
     notify(result.message || "全部题目提交成功，积分+1");
   } catch (error) { notify(error.message); }
+}
+
+function editClass(id) {
+  const course = data.classes.find((item) => String(item.id) === String(id));
+  if (!course) return notify("班级不存在");
+  openModal("修改班级", `<div class="field"><label>课程名称</label><input id="cc" value="${esc(course.name)}"></div><div class="row"><div class="field" style="flex:1;min-width:180px"><label>课程开始日期</label><input id="cs" type="date" value="${esc(course.startDate || "")}"></div><div class="field" style="flex:1;min-width:180px"><label>课程结束日期（选填）</label><input id="ce" type="date" value="${esc(course.endDate || "")}"></div></div><button class="primary" onclick="saveClass(${course.id})">保存班级</button>`);
+}
+
+async function saveClass(id) {
+  try {
+    await api("/api/classes/" + encodeURIComponent(id), { method: "PATCH", body: { name: $("cc").value, startDate: $("cs").value, endDate: $("ce").value } });
+    await loadState();
+    closeModal();
+    render();
+    notify("班级已更新");
+  } catch (error) { notify(error.message); }
+}
+
+function deleteClassAsk(id) {
+  const course = data.classes.find((item) => String(item.id) === String(id));
+  if (!course) return notify("班级不存在");
+  openModal("删除班级", `<p>确定删除 <strong>${esc(course.name)}</strong> 吗？这个班的作业、签到、课件和名单会一起删除。</p><div class="row" style="justify-content:flex-end;gap:12px"><button class="secondary" onclick="closeModal()">取消</button><button class="primary" style="background:#b42318;border-color:#b42318" onclick="confirmDeleteClass(${course.id})">确认删除</button></div>`);
+}
+
+async function confirmDeleteClass(id) {
+  try {
+    await api("/api/classes/" + encodeURIComponent(id), { method: "DELETE" });
+    currentClass = 0;
+    await loadState();
+    closeModal();
+    render();
+    notify("班级已删除");
+  } catch (error) { notify(error.message); }
+}
+
+function removeStudentAsk(account, name) {
+  openModal("移出学生", `<p>确定把 ${esc(name)}（${esc(account)}）移出当前班级吗？账号仍保留，只是不再出现在这份名单里。</p><div class="row" style="justify-content:flex-end;gap:12px"><button class="secondary" onclick="closeModal()">取消</button><button class="primary" style="background:#b42318;border-color:#b42318" onclick="confirmRemoveStudent('${esc(account)}')">确认移出</button></div>`);
+}
+
+async function confirmRemoveStudent(account) {
+  try {
+    await api("/api/classes/" + encodeURIComponent(currentClass) + "/roster/" + encodeURIComponent(account), { method: "DELETE" });
+    await loadState();
+    closeModal();
+    render();
+    notify("已从名单移出");
+  } catch (error) { notify(error.message); }
+}
+
+function resetStudentPasswordAsk(account) {
+  openModal("重置学生密码", `<p class="muted">学号 ${esc(account)}</p><div class="field"><label>新密码</label><input id="studentNewPassword" value="123"></div><button class="primary" onclick="confirmResetStudentPassword('${esc(account)}')">保存新密码</button>`);
+}
+
+async function confirmResetStudentPassword(account) {
+  try {
+    await api("/api/classes/" + encodeURIComponent(currentClass) + "/roster/" + encodeURIComponent(account) + "/password", {
+      method: "POST",
+      body: { password: $("studentNewPassword").value }
+    });
+    closeModal();
+    notify("学生密码已重置");
+  } catch (error) { notify(error.message); }
+}
+
+function newNotice() {
+  const options = data.classes.map((course) => `<option value="${esc(course.id)}">${esc(course.name)}</option>`).join("");
+  openModal("发布通知", `<div class="field"><label>发送范围</label><select id="noticeClass"><option value="">全部班级</option>${options}</select></div><div class="field"><label>通知内容</label><textarea id="noticeBody" rows="4" placeholder="写给这个班或全部班级的通知"></textarea></div><button class="primary" onclick="publishNotice()">发布</button>`);
+}
+
+async function publishNotice() {
+  const body = $("noticeBody")?.value.trim() || "";
+  if (!body) return notify("请填写通知内容");
+  try {
+    await api("/api/notices", { method: "POST", body: { classId: $("noticeClass").value, body } });
+    await loadState();
+    closeModal();
+    render();
+    notify("通知已发布");
+  } catch (error) { notify(error.message); }
+}
+
+const liveRecorders = new Map();
+
+function stopAllRecordings() {
+  for (const item of liveRecorders.values()) {
+    try { item.rec.stop(); } catch { /* already stopped */ }
+    item.stream.getTracks().forEach((track) => track.stop());
+  }
+  liveRecorders.clear();
+}
+
+async function toggleAnswerRecord(index) {
+  const existing = liveRecorders.get(index);
+  const button = document.getElementById("record-btn-" + index);
+  if (existing) {
+    existing.rec.stop();
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    return notify("当前浏览器不能录音，请改用附件上传");
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    return notify("无法使用麦克风，请改用附件上传录音");
+  }
+  const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  const chunks = [];
+  rec.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+  rec.onstop = () => {
+    stream.getTracks().forEach((track) => track.stop());
+    liveRecorders.delete(index);
+    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+    const ext = String(blob.type).includes("mp4") ? "m4a" : "webm";
+    const file = new File([blob], "录音-第" + (index + 1) + "题." + ext, { type: blob.type || "audio/webm" });
+    const input = document.getElementById("answer-file-" + index);
+    if (input) {
+      const transfer = new DataTransfer();
+      [...input.files].forEach((item) => transfer.items.add(item));
+      transfer.items.add(file);
+      input.files = transfer.files;
+      input.dispatchEvent(new Event("change"));
+    }
+    if (button) button.textContent = "录制本题语音";
+    notify("录音已加入本题附件");
+  };
+  liveRecorders.set(index, { rec, stream });
+  rec.start();
+  if (button) button.textContent = "停止录音";
 }
 
 function review(taskId) {
