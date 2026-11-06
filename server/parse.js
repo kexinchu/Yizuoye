@@ -1,7 +1,14 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import mammoth from 'mammoth';
 import ExcelJS from 'exceljs';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { HttpError } from './errors.js';
+
+const execFileAsync = promisify(execFile);
 
 export function decodeText(buffer) {
   try {
@@ -72,6 +79,53 @@ async function extractPdf(buffer) {
   }
 }
 
+function readableLength(text) {
+  return String(text || '').replace(/\s/g, '').length;
+}
+
+function commandFailure(error) {
+  const stderr = error?.stderr ? error.stderr.toString() : '';
+  return (stderr || error?.message || '识别失败').replace(/\s+/g, ' ').slice(0, 180);
+}
+
+async function ocrImageFile(filePath) {
+  const result = await execFileAsync('tesseract', [filePath, 'stdout', '-l', 'chi_sim+eng', '--psm', '6'], {
+    timeout: 120000,
+    maxBuffer: 30 * 1024 * 1024,
+  });
+  return String(result.stdout || '').trim();
+}
+
+async function ocrImageBuffer(buffer, suffix) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yz-ocr-'));
+  try {
+    const imagePath = path.join(dir, `page${suffix || '.png'}`);
+    await fs.writeFile(imagePath, buffer);
+    return await ocrImageFile(imagePath);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function ocrPdf(buffer) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yz-pdf-'));
+  try {
+    const pdfPath = path.join(dir, 'input.pdf');
+    await fs.writeFile(pdfPath, buffer);
+    await execFileAsync('pdftoppm', ['-png', '-r', '200', '-f', '1', '-l', '8', pdfPath, path.join(dir, 'page')], {
+      timeout: 120000,
+      maxBuffer: 30 * 1024 * 1024,
+    });
+    const pages = (await fs.readdir(dir)).filter((name) => name.endsWith('.png')).sort();
+    if (!pages.length) throw new Error('没有从 PDF 中得到可识别的页面');
+    const texts = [];
+    for (const page of pages) texts.push(await ocrImageFile(path.join(dir, page)));
+    return texts.join('\n').trim();
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function extractXlsx(buffer) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
@@ -90,16 +144,34 @@ async function extractXlsx(buffer) {
 
 export async function extractBuffer(buffer, filename, mime = '') {
   const name = String(filename || '').toLowerCase();
-  if (/\.(txt|md|csv|json|html)$/i.test(name) || String(mime).startsWith('text/')) return decodeText(buffer);
+  const type = String(mime || '').toLowerCase();
+  if (/\.(txt|md|csv|json|html)$/i.test(name) || type.startsWith('text/')) return decodeText(buffer);
   if (/\.docx$/i.test(name)) {
     const result = await mammoth.extractRawText({ buffer });
     return result.value || '';
   }
-  if (/\.pdf$/i.test(name)) return extractPdf(buffer);
+  if (/\.pdf$/i.test(name) || type === 'application/pdf') {
+    let text = '';
+    try { text = await extractPdf(buffer); } catch { text = ''; }
+    if (readableLength(text) >= 8) return text;
+    try {
+      return await ocrPdf(buffer);
+    } catch (error) {
+      throw new Error(`扫描版 PDF 本地识别失败：${commandFailure(error)}`);
+    }
+  }
   if (/\.(xlsx|xlsm)$/i.test(name)) return extractXlsx(buffer);
   if (/\.xls$/i.test(name)) throw new Error('请将旧版 .xls 另存为 .xlsx 或 CSV');
   if (/\.doc$/i.test(name)) throw new Error('请将旧版 .doc 另存为 .docx，或把文字粘贴到输入框');
-  throw new Error('此格式需要 OCR 或人工粘贴，当前不能自动读取');
+  if (/\.(png|jpe?g|webp|bmp|gif|tiff?)$/i.test(name) || type.startsWith('image/')) {
+    const suffix = path.extname(name) || '.png';
+    try {
+      return await ocrImageBuffer(buffer, suffix);
+    } catch (error) {
+      throw new Error(`图片本地识别失败：${commandFailure(error)}`);
+    }
+  }
+  throw new Error('此格式需要人工粘贴，当前不能自动读取');
 }
 
 export function splitTeacherQuestions(raw) {

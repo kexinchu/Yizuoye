@@ -16,7 +16,6 @@ import {
   createCourseware,
   createProduct,
   createResource,
-  createSession,
   createSubmission,
   createTask,
   deleteTask,
@@ -26,8 +25,12 @@ import {
   getDownload,
   importRoster,
   login,
+  one,
   publicUser,
+  ready,
+  redis,
   redeemProduct,
+  register,
   resetDemo,
   reviewSubmission,
   setMakeupWindow,
@@ -76,10 +79,11 @@ function readCookie(req) {
 }
 
 function requireUser(req, res, next) {
-  const user = userFromToken(readCookie(req));
-  if (!user) return res.status(401).json({ error: '请先登录' });
-  req.user = user;
-  next();
+  userFromToken(readCookie(req)).then((user) => {
+    if (!user) return res.status(401).json({ error: '请先登录' });
+    req.user = user;
+    next();
+  }).catch(next);
 }
 
 function requireTeacher(req, res, next) {
@@ -90,7 +94,7 @@ function requireTeacher(req, res, next) {
 async function textFromUpload(file) {
   const buffer = fs.readFileSync(file.path);
   const text = await extractBuffer(buffer, originalName(file), file.mimetype || '');
-  if (!String(text || '').trim()) throw new HttpError(400, '没有提取到可识别文字（扫描件可能需要 OCR）');
+  if (!String(text || '').trim()) throw new HttpError(400, '没有提取到可识别文字');
   return text;
 }
 
@@ -112,41 +116,56 @@ export function createApp() {
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
-    next();
+    ready().then(() => next(), next);
   });
 
-  app.get('/api/health', (req, res) => {
-    res.json({ ok: true, service: 'yizuoye' });
-  });
+  app.get('/api/health', route(async (req, res) => {
+    const [row, pong] = await Promise.all([one('SELECT 1 AS ok'), redis.ping()]);
+    const postgres = Number(row?.ok) === 1;
+    const redisOk = pong === 'PONG';
+    res.json({
+      ok: postgres && redisOk,
+      service: 'yizuoye',
+      postgres,
+      redis: redisOk,
+      ocr: 'tesseract:chi_sim+eng',
+    });
+  }));
 
-  app.post('/api/auth/login', route(async (req, res) => {
-    const result = login(req.body || {});
+  app.post('/api/auth/register', route(async (req, res) => {
+    const result = await register(req.body || {});
     res.setHeader('Set-Cookie', cookie(result.token, result.maxAge));
     res.json({ user: result.user, loginReward: result.loginReward });
   }));
 
-  app.post('/api/auth/logout', (req, res) => {
-    destroySession(readCookie(req));
+  app.post('/api/auth/login', route(async (req, res) => {
+    const result = await login(req.body || {});
+    res.setHeader('Set-Cookie', cookie(result.token, result.maxAge));
+    res.json({ user: result.user, loginReward: result.loginReward });
+  }));
+
+  app.post('/api/auth/logout', route(async (req, res) => {
+    await destroySession(readCookie(req));
     res.setHeader('Set-Cookie', cookie(''));
     res.json({ ok: true });
-  });
+  }));
 
-  app.get('/api/auth/me', (req, res) => {
-    const user = userFromToken(readCookie(req));
+  app.get('/api/auth/me', route(async (req, res) => {
+    const user = await userFromToken(readCookie(req));
     res.json({ user: user ? publicUser(user) : null });
-  });
+  }));
 
-  app.get('/api/state', requireUser, (req, res) => {
-    res.json(buildState(req.user));
-  });
+  app.get('/api/state', requireUser, route(async (req, res) => {
+    res.json(await buildState(req.user));
+  }));
 
   app.post('/api/classes', requireUser, requireTeacher, route(async (req, res) => {
-    createClass(req.body || {});
+    await createClass(req.body || {});
     res.json({ ok: true });
   }));
 
   app.post('/api/classes/:id/roster', requireUser, requireTeacher, route(async (req, res) => {
-    const result = importRoster(req.params.id, req.body?.text || '');
+    const result = await importRoster(req.params.id, req.body?.text || '');
     res.json({ ok: true, ...result });
   }));
 
@@ -180,7 +199,7 @@ export function createApp() {
     const ok = results.filter((item) => item.ok).length;
     let summary = `已读取 ${ok}/${files.length} 份文件。`;
     summary += errors.length
-      ? ` 暂无法识别：${errors.join('；')}。可粘贴文字，或改用 DOCX、文字型 PDF、TXT、Excel。`
+      ? ` 暂无法识别：${errors.join('；')}。可粘贴文字，或改用图片、DOCX、PDF、TXT、Excel。`
       : ' 点击「合并文档并自动分题」预览。';
     res.json({ files: results, summary });
   }));
@@ -192,7 +211,7 @@ export function createApp() {
   app.post('/api/classes/:id/tasks', requireUser, requireTeacher, upload.array('files', 20), route(async (req, res) => {
     const files = uploadsOf(req);
     for (const file of files) file.originalname = originalName(file);
-    createTask({
+    await createTask({
       classId: req.params.id,
       title: req.body?.title,
       week: req.body?.week,
@@ -208,12 +227,12 @@ export function createApp() {
   }));
 
   app.delete('/api/tasks/:id', requireUser, requireTeacher, route(async (req, res) => {
-    deleteTask(req.params.id);
+    await deleteTask(req.params.id);
     res.json({ ok: true });
   }));
 
   app.delete('/api/tasks/:id/files/:fileId', requireUser, requireTeacher, route(async (req, res) => {
-    deleteTaskFile(req.params.id, req.params.fileId);
+    await deleteTaskFile(req.params.id, req.params.fileId);
     res.json({ ok: true });
   }));
 
@@ -222,19 +241,19 @@ export function createApp() {
     for (const file of files) file.originalname = originalName(file);
     let parts = [];
     try { parts = JSON.parse(req.body?.parts || '[]'); } catch { throw new HttpError(400, '答案数据无法读取'); }
-    const result = createSubmission({ taskId: req.params.id, student: req.user, parts, uploads: files });
+    const result = await createSubmission({ taskId: req.params.id, student: req.user, parts, uploads: files });
     res.json({ ok: true, ...result });
   }));
 
   app.post('/api/tasks/:id/review', requireUser, requireTeacher, route(async (req, res) => {
-    reviewSubmission({ taskId: req.params.id, studentId: req.body?.studentId, feedback: req.body?.feedback });
+    await reviewSubmission({ taskId: req.params.id, studentId: req.body?.studentId, feedback: req.body?.feedback });
     res.json({ ok: true });
   }));
 
   app.post('/api/classes/:id/courseware', requireUser, requireTeacher, upload.array('files', 20), route(async (req, res) => {
     const files = uploadsOf(req);
     for (const file of files) file.originalname = originalName(file);
-    createCourseware({
+    await createCourseware({
       classId: req.params.id,
       mode: req.body?.mode,
       title: req.body?.title,
@@ -247,22 +266,22 @@ export function createApp() {
   }));
 
   app.post('/api/messages', requireUser, route(async (req, res) => {
-    addMessage(req.user, req.body?.body);
+    await addMessage(req.user, req.body?.body);
     res.json({ ok: true });
   }));
 
   app.post('/api/attendance', requireUser, requireTeacher, route(async (req, res) => {
-    createAttendance({ classId: req.body?.classId, start: req.body?.start, end: req.body?.end });
+    await createAttendance({ classId: req.body?.classId, start: req.body?.start, end: req.body?.end });
     res.json({ ok: true });
   }));
 
   app.post('/api/attendance/:id/makeup-window', requireUser, requireTeacher, route(async (req, res) => {
-    setMakeupWindow(req.params.id, req.body?.start, req.body?.end);
+    await setMakeupWindow(req.params.id, req.body?.start, req.body?.end);
     res.json({ ok: true });
   }));
 
   app.post('/api/attendance/:id/checkin', requireUser, route(async (req, res) => {
-    const result = checkin({
+    const result = await checkin({
       attendanceId: req.params.id,
       student: req.user,
       makeup: Boolean(req.body?.makeup),
@@ -272,39 +291,35 @@ export function createApp() {
   }));
 
   app.post('/api/products', requireUser, requireTeacher, route(async (req, res) => {
-    createProduct(req.body || {});
+    await createProduct(req.body || {});
     res.json({ ok: true });
   }));
 
   app.post('/api/products/:id/redeem', requireUser, route(async (req, res) => {
-    redeemProduct(req.user, req.params.id);
+    await redeemProduct(req.user, req.params.id);
     res.json({ ok: true });
   }));
 
   app.post('/api/resources', requireUser, requireTeacher, upload.single('file'), route(async (req, res) => {
     if (req.file) req.file.originalname = originalName(req.file);
-    createResource(req.file, req.file ? req.file.originalname : '');
+    await createResource(req.file, req.file ? req.file.originalname : '');
     res.json({ ok: true });
   }));
 
-  app.get('/api/files/:id', requireUser, (req, res, next) => {
-    try {
-      const { file, full } = getDownload(req.user, req.params.id);
-      res.setHeader('Content-Type', file.mime || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`);
-      res.sendFile(full);
-    } catch (error) {
-      next(error);
-    }
-  });
+  app.get('/api/files/:id', requireUser, route(async (req, res) => {
+    const { file, full } = await getDownload(req.user, req.params.id);
+    res.setHeader('Content-Type', file.mime || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`);
+    res.sendFile(full);
+  }));
 
   app.post('/api/account/password', requireUser, route(async (req, res) => {
-    changePassword(req.user, req.body?.oldPassword, req.body?.newPassword);
+    await changePassword(req.user, req.body?.oldPassword, req.body?.newPassword);
     res.json({ ok: true });
   }));
 
   app.post('/api/admin/reset', requireUser, requireTeacher, route(async (req, res) => {
-    resetDemo(readCookie(req));
+    await resetDemo(readCookie(req));
     res.json({ ok: true });
   }));
 
@@ -318,14 +333,15 @@ export function createApp() {
     if (error?.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: '单个文件不能超过 80MB' });
     if (error?.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: '一次最多上传 20 个文件' });
     if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
-    if (String(error?.message || '').includes('UNIQUE constraint')) return res.status(400).json({ error: '请勿重复操作' });
+    if (error?.code === '23505' || String(error?.message || '').includes('duplicate key')) return res.status(400).json({ error: '请勿重复操作' });
     console.error(error);
     res.status(500).json({ error: '服务器处理失败' });
   });
   return app;
 }
 
-export function start(port = Number(process.env.PORT || 8080), host = process.env.HOST || '127.0.0.1') {
+export async function start(port = Number(process.env.PORT || 8080), host = process.env.HOST || '127.0.0.1') {
+  await ready();
   const server = createApp().listen(port, host, () => {
     const address = server.address();
     const shownHost = host === '0.0.0.0' ? '127.0.0.1' : host;
@@ -335,4 +351,9 @@ export function start(port = Number(process.env.PORT || 8080), host = process.en
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) start();
+if (isMain) {
+  start().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

@@ -9,10 +9,15 @@ import { recognizeAssignment } from '../parse.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yizuoye-'));
 process.env.DATA_DIR = dataDir;
+process.env.DATABASE_URL = 'postgres://yizuoye:yizuoye@127.0.0.1:5432/yizuoye_test';
+process.env.REDIS_URL = 'redis://127.0.0.1:6379/1';
+process.env.YIZUOYE_RESET = '1';
 
 let server;
 after(async () => {
   if (server) await new Promise((resolve) => server.close(resolve));
+  const { closeStores } = await import('../db.js');
+  await closeStores();
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -167,10 +172,14 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   const zhang = client(base);
   const li = client(base);
 
-  expect(await teacher('GET', '/api/health'), 200);
+  const health = expect(await teacher('GET', '/api/health'), 200);
+  assert.equal(health.postgres, true);
+  assert.equal(health.redis, true);
+  assert.match(health.ocr, /tesseract/);
   const page = await teacher('GET', '/');
   assert.equal(page.status, 200);
   assert.match(page.body, /易作业/);
+  assert.match(page.body, /注册新账号/);
   assert.match(page.body, /\/actions\.js/);
   expect(await teacher('GET', '/api/state'), 401);
   expect(await teacher('POST', '/api/auth/login', { json: { role: 'teacher', account: 'teacher', password: 'nope' } }), 401);
@@ -183,6 +192,15 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   assert.equal(state.classes[0].students, 28);
   assert.equal(state.notices[0], '欢迎使用易作业！');
   assert.equal(state.tasks[0].sections[0].correct, '');
+
+  expect(await teacher('POST', '/api/auth/register', { json: { role: 'student', account: '2026888', name: '新同学', password: '12345' } }), 400);
+  const newbie = client(base);
+  const registered = expect(await newbie('POST', '/api/auth/register', { json: { role: 'student', account: '2026888', name: '新同学', password: 'secret1' } }), 200);
+  assert.equal(registered.user.name, '新同学');
+  assert.equal(registered.loginReward, true);
+  assert.equal(expect(await newbie('GET', '/api/state'), 200).points, 1);
+  expect(await teacher('POST', '/api/auth/register', { json: { role: 'teacher', account: '2026888', name: '重复', password: 'secret1' } }), 400);
+  expect(await newbie('POST', '/api/auth/logout'), 200);
 
   expect(await teacher('POST', '/api/classes', { json: { name: '汉语写作班', startDate: '2026-11-06', endDate: '2026-11-01' } }), 400);
   expect(await teacher('POST', '/api/classes', { json: { name: '汉语写作班', startDate: '2026-11-06', endDate: '2027-01-20' } }), 200);
@@ -216,6 +234,14 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   pdfForm.append('files', new Blob([makePdf('1. Hello Beijing')], { type: 'application/pdf' }), '阅读.pdf');
   const pdf = expect(await teacher('POST', '/api/tasks/extract', { form: pdfForm }), 200);
   assert.match(pdf.files[0].text, /Hello Beijing/);
+
+  const image = fs.readFileSync(new URL('./fixtures/question.png', import.meta.url));
+  const imageForm = new FormData();
+  imageForm.append('files', new Blob([image], { type: 'image/png' }), 'question.png');
+  const ocr = expect(await teacher('POST', '/api/tasks/extract', { form: imageForm }), 200);
+  assert.equal(ocr.files[0].ok, true, JSON.stringify(ocr.files[0]));
+  assert.match(ocr.files[0].text, /北京/);
+  assert.match(ocr.files[0].text, /上海/);
 
   const taskForm = new FormData();
   taskForm.append('title', '首都测验');

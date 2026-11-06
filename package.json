@@ -5,8 +5,8 @@
   "type": "module",
   "description": "易作业：同机部署的教学作业平台，前端页面与后端 API 分离。",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server/index.js",
-    "test": "node --disable-warning=ExperimentalWarning --test server/test/api.test.js"
+    "start": "node server/index.js",
+    "test": "node --test server/test/api.test.js"
   },
   "engines": {
     "node": ">=22.13.0"
@@ -16,6 +16,8 @@
     "express": "^4.21.2",
     "mammoth": "^1.9.1",
     "multer": "^2.0.2",
-    "pdfjs-dist": "^4.8.69"
+    "pdfjs-dist": "^4.8.69",
+    "pg": "^8.23.1",
+    "redis": "^4.7.1"
   }
 }

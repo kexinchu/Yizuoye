@@ -1,7 +1,8 @@
 Object.assign(UI_TRANSLATIONS, {
   "课件文件保存在本机服务器，同一台电脑上的浏览器都可以下载。": ["تُحفظ ملفات الدروس على خدمة هذا الجهاز.", "Les fichiers de cours sont enregistrés sur cet ordinateur.", "Course files are stored on this computer."],
   "文件保存在本机服务器。": ["تُحفظ الملفات على هذا الجهاز.", "Les fichiers sont enregistrés sur cet ordinateur.", "Files are stored on this computer."],
-  "服务会读取 TXT、CSV、Excel、Word 和文字型 PDF，旧版 DOC / XLS 请先另存。": ["يمكن قراءة TXT وCSV وExcel وWord وPDF النصي.", "TXT, CSV, Excel, Word et PDF texte peuvent être lus.", "TXT, CSV, Excel, Word, and text PDFs can be read."],
+  "服务会读取 TXT、CSV、Excel、Word、PDF 和图片，扫描件由本机文字识别处理，旧版 DOC / XLS 请先另存。": ["يقرأ TXT وCSV وExcel وWord وPDF والصور، ويتعرف على المسح محليًا.", "TXT, CSV, Excel, Word, PDF et images sont lus ; le scan est reconnu sur cet ordinateur.", "TXT, CSV, Excel, Word, PDFs, and images are read; scans are recognized on this computer."],
+  "支持读取 DOCX、PDF、TXT、Excel 和图片并自动分题；扫描件由本机文字识别处理，旧版 DOC 请另存。识别结果请教师核对。": ["يمكن قراءة DOCX وPDF وTXT وExcel والصور وتقسيم الأسئلة؛ يُتعرف على المسح محليًا.", "DOCX, PDF, TXT, Excel et images sont lus et découpés ; le scan est reconnu ici.", "DOCX, PDF, TXT, Excel, and images are read and split; scans are recognized on this computer."],
   "修改密码": ["تغيير كلمة المرور", "Changer le mot de passe", "Change Password"],
   "当前密码": ["كلمة المرور الحالية", "Mot de passe actuel", "Current Password"],
   "新密码": ["كلمة المرور الجديدة", "Nouveau mot de passe", "New Password"],
@@ -162,7 +163,7 @@ async function teacherTaskFilesChanged(input) {
   importedTaskTexts.clear();
   const status = $("teacherTaskStatus");
   if (!files.length) {
-    if (status) status.textContent = "支持读取 DOCX、文字型 PDF、TXT、Excel，并自动分题；扫描件和旧版 DOC 需要人工粘贴。识别结果请教师核对。";
+    if (status) status.textContent = "支持读取 DOCX、PDF、TXT、Excel 和图片并自动分题；扫描件由本机文字识别处理，旧版 DOC 请另存。识别结果请教师核对。";
     return;
   }
   if (status) status.textContent = "正在读取 " + files.length + " 份文件，请稍候……";
@@ -441,6 +442,82 @@ async function resetDemo() {
     notify("已重置演示数据");
   } catch (error) { notify(error.message); }
 }
+
+let authMode = "login";
+
+function authCopy() {
+  const lang = ($("loginLanguageSelect") && $("loginLanguageSelect").value) || "zh";
+  const copy = {
+    zh: { create: "注册新账号", back: "已有账号？返回登录", submit: "注册并进入 →", teacher: "教师姓名", student: "学生姓名" },
+    en: { create: "Create an account", back: "Already registered? Sign in", submit: "Create and enter →", teacher: "Teacher name", student: "Student name" },
+    fr: { create: "Créer un compte", back: "Déjà inscrit ? Se connecter", submit: "Créer et entrer →", teacher: "Nom de l’enseignant", student: "Nom de l’étudiant" },
+    ar: { create: "إنشاء حساب", back: "لديك حساب؟ تسجيل الدخول", submit: "إنشاء والدخول →", teacher: "اسم المعلم", student: "اسم الطالب" }
+  };
+  return copy[lang] || copy.zh;
+}
+
+function syncAuthMode() {
+  const register = authMode === "register";
+  const copy = authCopy();
+  const nameField = $("namefield");
+  if (nameField) nameField.classList.toggle("hidden", !register && role !== "student");
+  if (register && nameField) {
+    const label = nameField.querySelector("label");
+    if (label) label.textContent = role === "teacher" ? copy.teacher : copy.student;
+  }
+  const submit = $("submitAuth");
+  const toggle = $("toggleAuth");
+  if (submit && register) submit.textContent = copy.submit;
+  if (toggle) toggle.textContent = register ? copy.back : copy.create;
+}
+
+function toggleAuthMode() {
+  authMode = authMode === "login" ? "register" : "login";
+  if (authMode === "register") {
+    $("account").value = "";
+    $("studentname").value = "";
+    $("password").value = "";
+  } else {
+    $("studentname").value = "张三";
+    $("password").value = "123";
+    setRoleBase(role);
+  }
+  syncAuthMode();
+}
+
+async function submitAuth() {
+  if (authMode === "register") return registerAccount();
+  return login();
+}
+
+async function registerAccount() {
+  try {
+    const result = await api("/api/auth/register", {
+      method: "POST",
+      body: {
+        role,
+        account: $("account").value.trim(),
+        password: $("password").value,
+        name: $("studentname").value.trim()
+      }
+    });
+    authMode = "login";
+    await enterApp(result.loginReward);
+  } catch (error) {
+    notify(error.message || "注册失败");
+  }
+}
+
+const translateLoginBase = translateLoginUI;
+translateLoginUI = function () {
+  translateLoginBase();
+  syncAuthMode();
+};
+const setRoleBase = setRole;
+setRole = function (next) {
+  setRoleBase(next);
+  syncAuthMode();
+};
 
 async function boot() {
   translateLoginUI();
