@@ -9,8 +9,6 @@ import { recognizeAssignment } from '../parse.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yizuoye-'));
 process.env.DATA_DIR = dataDir;
-process.env.DATABASE_URL = 'postgres://yizuoye:yizuoye@127.0.0.1:5432/yizuoye_test';
-process.env.REDIS_URL = 'redis://127.0.0.1:6379/1';
 process.env.YIZUOYE_RESET = '1';
 
 let server;
@@ -173,8 +171,8 @@ test('同机 API 覆盖登录、作业、签到、积分和文件', async () => 
   const li = client(base);
 
   const health = expect(await teacher('GET', '/api/health'), 200);
-  assert.equal(health.postgres, true);
-  assert.equal(health.redis, true);
+  assert.equal(health.sqlite, true);
+  assert.equal(health.ok, true);
   assert.match(health.ocr, /tesseract/);
   const page = await teacher('GET', '/');
   assert.equal(page.status, 200);

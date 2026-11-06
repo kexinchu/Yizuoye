@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import multer from 'multer';
 import { HttpError } from './errors.js';
+import { deployOcr, ocrStatus } from './ocr-deploy.js';
 import { extractBuffer, originalName, recognizeAssignment } from './parse.js';
 import { buildState } from './state.js';
 import {
@@ -28,7 +29,6 @@ import {
   one,
   publicUser,
   ready,
-  redis,
   redeemProduct,
   register,
   resetDemo,
@@ -120,15 +120,14 @@ export function createApp() {
   });
 
   app.get('/api/health', route(async (req, res) => {
-    const [row, pong] = await Promise.all([one('SELECT 1 AS ok'), redis.ping()]);
-    const postgres = Number(row?.ok) === 1;
-    const redisOk = pong === 'PONG';
+    const row = await one('SELECT 1 AS ok');
+    const sqliteOk = Number(row?.ok) === 1;
+    const ocr = await ocrStatus();
     res.json({
-      ok: postgres && redisOk,
+      ok: sqliteOk,
       service: 'yizuoye',
-      postgres,
-      redis: redisOk,
-      ocr: 'tesseract:chi_sim+eng',
+      sqlite: sqliteOk,
+      ocr: ocr.ready ? 'tesseract:chi_sim+eng' : 'missing',
     });
   }));
 
@@ -333,7 +332,7 @@ export function createApp() {
     if (error?.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: '单个文件不能超过 80MB' });
     if (error?.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: '一次最多上传 20 个文件' });
     if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
-    if (error?.code === '23505' || String(error?.message || '').includes('duplicate key')) return res.status(400).json({ error: '请勿重复操作' });
+    if (error?.code === '23505' || /duplicate key|UNIQUE constraint/i.test(String(error?.message || ''))) return res.status(400).json({ error: '请勿重复操作' });
     console.error(error);
     res.status(500).json({ error: '服务器处理失败' });
   });
@@ -341,6 +340,7 @@ export function createApp() {
 }
 
 export async function start(port = Number(process.env.PORT || 8080), host = process.env.HOST || '127.0.0.1') {
+  await deployOcr();
   await ready();
   const server = createApp().listen(port, host, () => {
     const address = server.address();

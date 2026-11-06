@@ -2,8 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import pg from 'pg';
-import { createClient } from 'redis';
+import { DatabaseSync } from 'node:sqlite';
 import { hashPassword, verifyPassword } from './password.js';
 import { HttpError } from './errors.js';
 import { normalizeSections, parseRoster } from './parse.js';
@@ -13,23 +12,55 @@ export const uploadDir = path.join(dataDir, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 
 const SESSION_TTL = 7 * 24 * 3600;
-const databaseUrl = process.env.DATABASE_URL || 'postgres://yizuoye:yizuoye@127.0.0.1:5432/yizuoye';
-const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379/0';
-
-export const pool = new pg.Pool({ connectionString: databaseUrl });
-pool.on('error', (error) => console.error('Postgres', error.message));
-
-export const redis = createClient({ url: redisUrl });
-redis.on('error', (error) => console.error('Redis', error.message));
+const sqlite = new DatabaseSync(path.join(dataDir, 'yizuoye.sqlite'));
+sqlite.exec('PRAGMA journal_mode = WAL');
+sqlite.exec('PRAGMA busy_timeout = 5000');
 
 const queryContext = new AsyncLocalStorage();
+let queue = Promise.resolve();
 
-function db() {
-  return queryContext.getStore() || pool;
+function enqueue(fn) {
+  const run = queue.then(fn, fn);
+  queue = run.then(() => {}, () => {});
+  return run;
 }
 
-export async function q(text, params = []) {
-  return db().query(text, params);
+function adaptSql(sql) {
+  const now = new Date().toISOString();
+  const text = sql.replace(/\bNOW\(\)/gi, `'${now}'`).replace(/::(?:int|integer|bigint|text)\b/gi, '');
+  const order = [];
+  const rewritten = text.replace(/\$(\d+)/g, (_, index) => {
+    order.push(Number(index) - 1);
+    return '?';
+  });
+  return { sql: rewritten, order };
+}
+
+function bind(params, order) {
+  return order.map((index) => (params[index] === undefined ? null : params[index]));
+}
+
+function qSync(text, params = []) {
+  const { sql, order } = adaptSql(text);
+  const values = bind(params, order);
+  const statement = sqlite.prepare(sql);
+  const readsRows = /^\s*(select|with)\b/i.test(sql) || /\breturning\b/i.test(sql);
+  try {
+    if (readsRows) {
+      const rows = statement.all(...values).map((row) => ({ ...row }));
+      return { rows, rowCount: rows.length };
+    }
+    const result = statement.run(...values);
+    return { rows: [], rowCount: Number(result.changes || 0) };
+  } catch (error) {
+    if (String(error.message || '').includes('UNIQUE')) error.code = '23505';
+    throw error;
+  }
+}
+
+export function q(text, params = []) {
+  if (queryContext.getStore()) return Promise.resolve(qSync(text, params));
+  return enqueue(() => qSync(text, params));
 }
 
 export async function one(text, params = []) {
@@ -42,20 +73,25 @@ export async function many(text, params = []) {
   return result.rows;
 }
 
-export async function transaction(fn) {
+export function transaction(fn) {
   if (queryContext.getStore()) return fn();
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await queryContext.run(client, fn);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    try { await client.query('ROLLBACK'); } catch { /* already closed */ }
-    throw error;
-  } finally {
-    client.release();
-  }
+  return enqueue(() => queryContext.run(true, async () => {
+    sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      const result = await fn();
+      sqlite.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { sqlite.exec('ROLLBACK'); } catch { /* already closed */ }
+      throw error;
+    }
+  }));
+}
+
+function adaptSchema(sql) {
+  return sql
+    .replace(/SERIAL PRIMARY KEY/g, 'INTEGER PRIMARY KEY AUTOINCREMENT')
+    .replace(/TIMESTAMPTZ NOT NULL DEFAULT NOW\(\)/g, "TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))");
 }
 
 const SCHEMA = `
@@ -170,11 +206,14 @@ CREATE TABLE IF NOT EXISTS files (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS files_kind_ref ON files(kind, ref_id);
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 `;
-
-function sessionKey(token) {
-  return `yz:session:${token}`;
-}
 
 export function todayKey(date = new Date()) {
   const pad = (value) => String(value).padStart(2, '0');
@@ -253,16 +292,6 @@ async function seedContent() {
   await q('INSERT INTO resources(name, created_at) VALUES ($1, NOW())', ['汉语口语练习材料.docx']);
 }
 
-async function clearSessions() {
-  const keys = [];
-  if (!redis.isOpen) return;
-  for await (const key of redis.scanIterator({ MATCH: 'yz:session:*', COUNT: 100 })) {
-    if (Array.isArray(key)) keys.push(...key);
-    else keys.push(key);
-  }
-  if (keys.length) await redis.del(keys);
-}
-
 let starting;
 export function ready() {
   if (!starting) {
@@ -275,37 +304,36 @@ export function ready() {
 }
 
 async function migrateAndSeed() {
-  if (!redis.isOpen) await redis.connect();
-  await pool.query(SCHEMA);
+  sqlite.exec(adaptSchema(SCHEMA));
   if (process.env.YIZUOYE_RESET === '1') {
     process.env.YIZUOYE_RESET = '0';
     await resetDemo(null);
     return;
   }
-  const count = await pool.query('SELECT COUNT(*)::int AS n FROM users');
-  if (count.rows[0].n === 0) await transaction(seedContent);
+  const count = await one('SELECT COUNT(*) AS n FROM users');
+  if (Number(count?.n || 0) === 0) await transaction(seedContent);
 }
 
 export async function closeStores() {
-  if (redis.isOpen) await redis.quit();
-  await pool.end();
+  try { sqlite.close(); } catch { /* already closed */ }
 }
 
 export async function createSession(userId) {
   const token = randomUUID() + randomUUID().replace(/-/g, '');
-  await redis.set(sessionKey(token), String(userId), { EX: SESSION_TTL });
+  const expires = new Date(Date.now() + SESSION_TTL * 1000).toISOString();
+  await q('INSERT INTO sessions(token, user_id, created_at, expires_at) VALUES ($1, $2, NOW(), $3)', [token, userId, expires]);
   return { token, maxAge: SESSION_TTL };
 }
 
 export async function destroySession(token) {
-  if (token) await redis.del(sessionKey(token));
+  if (token) await q('DELETE FROM sessions WHERE token=$1', [token]);
 }
 
 export async function userFromToken(token) {
   if (!token) return null;
-  const userId = await redis.get(sessionKey(token));
-  if (!userId) return null;
-  return one('SELECT * FROM users WHERE id=$1', [Number(userId)]);
+  const now = new Date().toISOString();
+  await q('DELETE FROM sessions WHERE expires_at <= $1', [now]);
+  return one('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=$1', [token]);
 }
 
 export function publicUser(user) {
@@ -715,15 +743,20 @@ export async function changePassword(user, oldPassword, newPassword) {
 export async function resetDemo(currentToken) {
   const uploads = fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir) : [];
   await transaction(async () => {
-    await q(`TRUNCATE TABLE files, checkins, attendance, courseware, resources, notices, messages, products, submissions, tasks, roster, classes, users RESTART IDENTITY`);
+    for (const table of ['files', 'checkins', 'attendance', 'courseware', 'resources', 'notices', 'messages', 'products', 'submissions', 'tasks', 'roster', 'classes', 'sessions', 'users']) {
+      await q(`DELETE FROM ${table}`);
+    }
+    try { sqlite.exec('DELETE FROM sqlite_sequence'); } catch { /* no autoincrement rows yet */ }
     await seedContent();
+    if (currentToken) {
+      const teacher = await one(`SELECT id FROM users WHERE account='teacher'`);
+      if (teacher) {
+        const expires = new Date(Date.now() + SESSION_TTL * 1000).toISOString();
+        await q('INSERT INTO sessions(token, user_id, created_at, expires_at) VALUES ($1, $2, NOW(), $3)', [currentToken, teacher.id, expires]);
+      }
+    }
   });
   for (const name of uploads) fs.rmSync(path.join(uploadDir, name), { force: true });
-  await clearSessions();
-  if (currentToken) {
-    const teacher = await one(`SELECT id FROM users WHERE account='teacher'`);
-    if (teacher) await redis.set(sessionKey(currentToken), String(teacher.id), { EX: SESSION_TTL });
-  }
 }
 
 export function discardUploads(uploads) {
