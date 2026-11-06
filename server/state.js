@@ -1,4 +1,4 @@
-import { db, getUser } from './db.js';
+import { getUser, many } from './db.js';
 
 function displayTime(iso) {
   const date = new Date(iso);
@@ -8,14 +8,15 @@ function displayTime(iso) {
   return `${date.toLocaleDateString('zh-CN')} ${time}`;
 }
 
-export function buildState(user) {
-  const fresh = getUser(user.id) || user;
-  const classes = db.prepare('SELECT * FROM classes ORDER BY id').all().map((course) => {
-    const roster = db.prepare(`SELECT u.account AS id, u.name AS name
+export async function buildState(user) {
+  const fresh = await getUser(user.id) || user;
+  const classes = [];
+  for (const course of await many('SELECT * FROM classes ORDER BY id')) {
+    const roster = (await many(`SELECT u.account AS id, u.name AS name
       FROM roster r JOIN users u ON u.id = r.student_id
-      WHERE r.class_id = ? ORDER BY u.account`).all(course.id)
+      WHERE r.class_id = $1 ORDER BY u.account`, [course.id]))
       .map((row) => ({ id: row.id, name: row.name }));
-    return {
+    classes.push({
       id: course.id,
       name: course.name,
       course: course.course,
@@ -23,18 +24,19 @@ export function buildState(user) {
       startDate: course.start_date || '',
       endDate: course.end_date || '',
       roster,
-    };
-  });
+    });
+  }
 
-  const tasks = db.prepare('SELECT * FROM tasks ORDER BY id').all().map((task) => {
+  const tasks = [];
+  for (const task of await many('SELECT * FROM tasks ORDER BY id')) {
     const sections = JSON.parse(task.sections_json).map((section) => {
       if (fresh.role === 'teacher') return section;
       const hidden = { ...section };
       delete hidden.correct;
       return hidden;
     });
-    const attachments = db.prepare(`SELECT id, name FROM files WHERE kind='task' AND ref_id=? ORDER BY created_at`).all(String(task.id));
-    return {
+    const attachments = await many(`SELECT id, name FROM files WHERE kind='task' AND ref_id=$1 ORDER BY created_at`, [String(task.id)]);
+    tasks.push({
       id: task.id,
       cid: task.class_id,
       title: task.title,
@@ -45,17 +47,14 @@ export function buildState(user) {
       types: task.types || '',
       notes: task.notes || '',
       attachments,
-    };
-  });
+    });
+  }
 
-  const submissionSql = fresh.role === 'teacher'
-    ? `SELECT s.*, u.account AS student_account, u.name AS student_name
-      FROM submissions s JOIN users u ON u.id = s.student_id ORDER BY s.id`
-    : `SELECT s.*, u.account AS student_account, u.name AS student_name
-      FROM submissions s JOIN users u ON u.id = s.student_id WHERE s.student_id = ? ORDER BY s.id`;
   const submissionRows = fresh.role === 'teacher'
-    ? db.prepare(submissionSql).all()
-    : db.prepare(submissionSql).all(fresh.id);
+    ? await many(`SELECT s.*, u.account AS student_account, u.name AS student_name
+      FROM submissions s JOIN users u ON u.id = s.student_id ORDER BY s.id`)
+    : await many(`SELECT s.*, u.account AS student_account, u.name AS student_name
+      FROM submissions s JOIN users u ON u.id = s.student_id WHERE s.student_id = $1 ORDER BY s.id`, [fresh.id]);
   const submissions = submissionRows.map((row) => ({
     tid: row.task_id,
     studentId: row.student_account,
@@ -68,10 +67,11 @@ export function buildState(user) {
     feedback: row.feedback || '',
   }));
 
-  const attendance = db.prepare('SELECT * FROM attendance ORDER BY id DESC').all().map((row) => {
-    const checks = db.prepare(`SELECT c.kind, c.reason, c.created_at, u.account, u.name
-      FROM checkins c JOIN users u ON u.id = c.student_id WHERE c.attendance_id=?`).all(row.id);
-    return {
+  const attendance = [];
+  for (const row of await many('SELECT * FROM attendance ORDER BY id DESC')) {
+    const checks = await many(`SELECT c.kind, c.reason, c.created_at, u.account, u.name
+      FROM checkins c JOIN users u ON u.id = c.student_id WHERE c.attendance_id=$1`, [row.id]);
+    attendance.push({
       id: row.id,
       cid: row.class_id,
       title: row.title,
@@ -87,8 +87,8 @@ export function buildState(user) {
         source: 'student',
       })),
       makeupWindow: row.makeup_start ? { start: row.makeup_start, end: row.makeup_end } : null,
-    };
-  });
+    });
+  }
 
   return {
     role: fresh.role,
@@ -96,13 +96,13 @@ export function buildState(user) {
     name: fresh.name,
     classes,
     tasks,
-    products: db.prepare('SELECT id, name, cost, stock, emoji FROM products ORDER BY id').all(),
-    messages: db.prepare('SELECT name, body, created_at FROM messages ORDER BY id DESC LIMIT 200').all()
+    products: await many('SELECT id, name, cost, stock, emoji FROM products ORDER BY id'),
+    messages: (await many('SELECT name, body, created_at FROM messages ORDER BY id DESC LIMIT 200'))
       .map((row) => ({ name: row.name, body: row.body, time: displayTime(row.created_at) })),
-    notices: db.prepare('SELECT body FROM notices ORDER BY id DESC LIMIT 100').all().map((row) => row.body),
-    resources: db.prepare(`SELECT r.id, r.name, f.id AS file_id
-      FROM resources r LEFT JOIN files f ON f.kind = 'resource' AND f.ref_id = CAST(r.id AS TEXT)
-      ORDER BY r.id`).all().map((row) => ({
+    notices: (await many('SELECT body FROM notices ORDER BY id DESC LIMIT 100')).map((row) => row.body),
+    resources: (await many(`SELECT r.id, r.name, f.id AS file_id
+      FROM resources r LEFT JOIN files f ON f.kind = 'resource' AND f.ref_id = r.id::text
+      ORDER BY r.id`)).map((row) => ({
       id: row.id,
       name: row.name,
       hasFile: Boolean(row.file_id),
@@ -112,7 +112,7 @@ export function buildState(user) {
     points: fresh.role === 'student' ? fresh.points : 0,
     lastLoginReward: fresh.last_login_reward || '',
     attendance,
-    courseware: db.prepare('SELECT * FROM courseware ORDER BY created_at DESC').all().map((row) => ({
+    courseware: (await many('SELECT * FROM courseware ORDER BY created_at DESC')).map((row) => ({
       id: row.id,
       cid: row.class_id,
       name: row.name,
